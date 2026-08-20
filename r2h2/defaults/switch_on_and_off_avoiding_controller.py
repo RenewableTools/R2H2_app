@@ -1,27 +1,27 @@
 """
-switchOffAvoidingController.py — R2H2 Engineering Controller
-============================================================
+switch_on_and_off_avoiding_controller.py — R2H2 Engineering Controller
+======================================================================
 
-This controller starts from the built-in dynamicControl logic and adds a
-plant-level switch-off avoidance hold.
+This controller starts from the built-in dynamicControl logic and adds
+plant-level avoidance hold logic for both switching on and switching off.
 
 If the standard dispatch would turn units off because filtered available power
 falls below the minimum power needed to keep them on, the controller first
-tries to cover that shortfall with the battery. Battery support is limited to:
+tries to cover that shortfall with the battery.
 
-  1. the same power-rate and SoC floor protections used by dynamicControl
-  2. a whole-plant hold timer of 120 seconds of active support
+If the standard dispatch would turn units on because filtered available power
+is high enough to require additional electrolyzers, the controller first tries
+to absorb that surplus with the battery instead.
 
-If the battery cannot fully cover the shortfall, the controller keeps as many
-units on as the supported power can sustain and only turns off the remainder.
-If the extra support requirement returns to zero, the hold timer is reset.
+Switch-on and switch-off holds use independent timers, each with its own
+configurable maximum duration.
 """
 
 import numpy as np
 
 
 def control(units, battery, t_out, settings):
-    """Built-in dispatch controller with switch-off avoidance support.
+    """Built-in dispatch controller with switch-on/off avoidance support.
 
     Required outputs (for downstream simulation):
     - t_out.arTotalElectroDemand: total electrolyser demand profile [W], length T_ctrl.
@@ -94,18 +94,23 @@ def control(units, battery, t_out, settings):
     rMin   = units[0].rMinPower_s
     rRated = units[0].rRatedPower_s
 
-    hold_max_s = 120.0
-    hold_remaining_s = float(
-        getattr(battery, "rSwitchOffAvoidingHoldRemaining_s", hold_max_s)
+    hold_on_max_s = float(getattr(battery, "rSwitchOnAvoidingHoldMax_s", 120.0))
+    hold_off_max_s = float(getattr(battery, "rSwitchOffAvoidingHoldMax_s", 120.0))
+    hold_on_remaining_s = float(
+        getattr(battery, "rSwitchOnAvoidingHoldRemaining_s", hold_on_max_s)
+    )
+    hold_off_remaining_s = float(
+        getattr(battery, "rSwitchOffAvoidingHoldRemaining_s", hold_off_max_s)
     )
 
+    t_out.arSwitchOnAvoidingSupport = np.zeros(T)
+    t_out.arSwitchOnAvoidingDeficit = np.zeros(T)
+    t_out.arSwitchOnAvoidingTimer = np.zeros(T)
     t_out.arSwitchOffAvoidingSupport = np.zeros(T)
-    t_out.arSwitchOffAvoidingTimer = np.zeros(T)
     t_out.arSwitchOffAvoidingDeficit = np.zeros(T)
+    t_out.arSwitchOffAvoidingTimer = np.zeros(T)
 
-    # The transient slots are handled by R2H2 before/after controller call.
-    # Dispatch therefore runs directly over the trimmed T_ctrl axis.
-    for k in range(T):
+    def _recompute_available_power(k: int) -> float:
         if k == 0:
             t_out.arElectroAvailablePower[k] = t_out.arElectroAvailablePowerA[k]
         else:
@@ -113,18 +118,39 @@ def control(units, battery, t_out, settings):
                 alpha * t_out.arElectroAvailablePowerA[k]
                 + (1.0 - alpha) * t_out.arElectroAvailablePower[k - 1]
             )
+        return float(t_out.arElectroAvailablePower[k])
+
+    # The transient slots are handled by R2H2 before/after controller call.
+    # Dispatch therefore runs directly over the trimmed T_ctrl axis.
+    for k in range(T):
+        available_power = _recompute_available_power(k)
 
         t_out.aiIsOn[:, k] = t_out.aiIsOn[:, k - 1]
         total_on_prev = int(t_out.arTotalElectroOn[k - 1])
-        available_power = float(t_out.arElectroAvailablePower[k])
-        support_required = 0.0
-        support_applied = 0.0
+        support_required_on = 0.0
+        support_applied_on = 0.0
+        support_required_off = 0.0
+        support_applied_off = 0.0
+
+        # --- Switch-on avoidance: absorb surplus with battery charging first ---
+        support_required_on = max(available_power - total_on_prev * rRated, 0.0)
+        if support_required_on > 0.0 and hold_on_remaining_s > 0.0:
+            support_headroom = max(per_sec_limit - float(battery.arBatteryDemand[k]), 0.0)
+            support_applied_on = min(support_required_on, support_headroom)
+            if support_applied_on > 0.0:
+                battery.arBatteryDemand[k] += support_applied_on
+                t_out.arElectroAvailablePowerA[k] = np.maximum(
+                    t_out.arAvailablePower[k] - battery.arBatteryDemand[k], 0.0
+                )
+                available_power = _recompute_available_power(k)
+                hold_on_remaining_s = max(hold_on_remaining_s - dt, 0.0)
+        elif support_required_on <= 0.0:
+            hold_on_remaining_s = hold_on_max_s
 
         arMaxElectro_k = int(np.floor(available_power / rMin)) if rMin > 0.0 else total_on_prev
         arMinElectro_k = int(np.ceil(available_power / rRated)) if rRated > 0.0 else 0
 
         if arMinElectro_k > total_on_prev and available_power > rMin * units[0].rDeadBandRatio:
-            hold_remaining_s = hold_max_s
             rank = np.argsort(degradation)
             need = arMinElectro_k - total_on_prev
             for idx in rank:
@@ -140,21 +166,20 @@ def control(units, battery, t_out, settings):
             t_out.arTotalElectroOn[k] = np.sum(t_out.aiIsOn[:, k])
 
         elif arMaxElectro_k < total_on_prev:
-            support_required = max(total_on_prev * rMin - available_power, 0.0)
-            if support_required <= 0.0:
-                hold_remaining_s = hold_max_s
+            support_required_off = max(total_on_prev * rMin - available_power, 0.0)
+            if support_required_off <= 0.0:
+                hold_off_remaining_s = hold_off_max_s
                 t_out.arTotalElectroOn[k] = total_on_prev
             else:
-                if initial_soc_scalar > 0.0 and hold_remaining_s > 0.0:
+                if initial_soc_scalar > 0.0 and hold_off_remaining_s > 0.0:
                     support_headroom = max(float(battery.arBatteryDemand[k]) + per_sec_limit, 0.0)
-                    support_applied = min(support_required, support_headroom)
+                    support_applied_off = min(support_required_off, support_headroom)
 
-                if support_applied > 0.0:
-                    battery.arBatteryDemand[k] -= support_applied
-                    t_out.arElectroAvailablePowerA[k] += support_applied
-                    available_power += support_applied
-                    t_out.arElectroAvailablePower[k] = available_power
-                    hold_remaining_s = max(hold_remaining_s - dt, 0.0)
+                if support_applied_off > 0.0:
+                    battery.arBatteryDemand[k] -= support_applied_off
+                    t_out.arElectroAvailablePowerA[k] += support_applied_off
+                    available_power = _recompute_available_power(k)
+                    hold_off_remaining_s = max(hold_off_remaining_s - dt, 0.0)
 
                 max_units_supported = (
                     int(np.floor(available_power / rMin)) if rMin > 0.0 else total_on_prev
@@ -174,7 +199,7 @@ def control(units, battery, t_out, settings):
                 t_out.arTotalElectroOn[k] = np.sum(t_out.aiIsOn[:, k])
 
         else:
-            hold_remaining_s = hold_max_s
+            hold_off_remaining_s = hold_off_max_s
             t_out.arTotalElectroOn[k] = total_on_prev
 
         if t_out.arTotalElectroOn[k] > 0:
@@ -182,12 +207,16 @@ def control(units, battery, t_out, settings):
                 t_out.aiIsOn[:, k] / t_out.arTotalElectroOn[k]
             )
 
-        t_out.arSwitchOffAvoidingSupport[k] = support_applied
-        t_out.arSwitchOffAvoidingDeficit[k] = support_required
-        t_out.arSwitchOffAvoidingTimer[k] = hold_remaining_s
+        t_out.arSwitchOnAvoidingSupport[k] = support_applied_on
+        t_out.arSwitchOnAvoidingDeficit[k] = support_required_on
+        t_out.arSwitchOnAvoidingTimer[k] = hold_on_remaining_s
+        t_out.arSwitchOffAvoidingSupport[k] = support_applied_off
+        t_out.arSwitchOffAvoidingDeficit[k] = support_required_off
+        t_out.arSwitchOffAvoidingTimer[k] = hold_off_remaining_s
 
     t_out.rPreviousValue = float(t_out.arElectroAvailablePower[-1])
-    battery.rSwitchOffAvoidingHoldRemaining_s = hold_remaining_s
+    battery.rSwitchOnAvoidingHoldRemaining_s = hold_on_remaining_s
+    battery.rSwitchOffAvoidingHoldRemaining_s = hold_off_remaining_s
 
     # Required controller output: total demand profile.
     t_out.arTotalElectroDemand = np.clip(
@@ -197,6 +226,9 @@ def control(units, battery, t_out, settings):
     )
     buffer = {
     "soc": battery.arSoC,
+    "switch_on_hold_timer_s": t_out.arSwitchOnAvoidingTimer,
+    "switch_on_hold_support_w": t_out.arSwitchOnAvoidingSupport,
+    "switch_on_hold_deficit_w": t_out.arSwitchOnAvoidingDeficit,
     "switch_off_hold_timer_s": t_out.arSwitchOffAvoidingTimer,
     "switch_off_hold_support_w": t_out.arSwitchOffAvoidingSupport,
     "switch_off_hold_deficit_w": t_out.arSwitchOffAvoidingDeficit,
