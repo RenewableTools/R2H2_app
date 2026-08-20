@@ -1029,6 +1029,11 @@ def _load_concatenated_wind(paths):
     combined.arPowerInput = np.concatenate(
         [s.arPowerInput for s in segments], axis=1
     )
+    combined.arWindSpeed = np.concatenate(
+        [np.asarray(getattr(s, 'arWindSpeed', np.array([], dtype=float)), dtype=float).ravel()
+         for s in segments],
+        axis=0,
+    )
     # arTime is the within-hour time axis — identical across files; keep first
     combined.arTime = segments[0].arTime
     return combined
@@ -1187,7 +1192,7 @@ def _save_run_outputs(run, results: dict) -> str:
 
             # Power time-series
             pwr = grp.create_group('power')
-            for key in ('arWindPowerFilt', 'arAvailablePower', 'arTotalElectroDemand'):
+            for key in ('arWindPowerFilt', 'arWindSpeed', 'arAvailablePower', 'arTotalElectroDemand'):
                 arr = log.get(key)
                 if arr is not None:
                     pwr.create_dataset(key, data=np.asarray(arr, dtype=np.float64),
@@ -1273,6 +1278,19 @@ def _run_simulation_thread(run_id):
         effective_start = None
         effective_end   = None
 
+        def _slice_wind_speed_hours(start_hour: int, end_hour: int) -> None:
+            """Slice hourly wind-speed series to match arPowerInput hour window."""
+            ws = getattr(wi, 'arWindSpeed', None)
+            if ws is None:
+                return
+            ws_arr = np.asarray(ws, dtype=float).ravel()
+            if ws_arr.size == 0:
+                return
+            sh = max(0, int(start_hour))
+            eh = max(sh, int(end_hour))
+            eh = min(eh, ws_arr.size)
+            setattr(wi, 'arWindSpeed', ws_arr[sh:eh])
+
         # If a specific date range is set, slice wind data to [start_date, end_date).
         # For integer-based wind files (no real timestamps), time origin is
         # 00:00 on 1-Jan of the datum_date year.
@@ -1286,6 +1304,7 @@ def _run_simulation_thread(run_id):
                 end_hour = min(end_hour, n_hours)
                 if start_hour < end_hour:
                     wi.arPowerInput = wi.arPowerInput[:, start_hour:end_hour]
+                    _slice_wind_speed_hours(start_hour, end_hour)
             effective_start = sim_obj.start_date
             effective_end   = sim_obj.end_date
         elif sim_obj.duration_days:
@@ -1296,6 +1315,7 @@ def _run_simulation_thread(run_id):
                 n_hours = wi.arPowerInput.shape[1]
                 if max_hours < n_hours:
                     wi.arPowerInput = wi.arPowerInput[:, :max_hours]
+                    _slice_wind_speed_hours(0, max_hours)
             datum = sim_obj.datum_date or _dt.date(_dt.date.today().year, 1, 1)
             effective_start = datum
             effective_end   = datum + _dt.timedelta(days=sim_obj.duration_days)
@@ -2028,6 +2048,7 @@ def view_run_results(request, sim_id, run_id):
             pwr_grp = yr_grp.get('power', {})
             for key, out_key in (
                 ('arWindPowerFilt',      'arWindPower'),
+                ('arWindSpeed',          'arWindSpeed'),
                 ('arAvailablePower',     'arAvailablePower'),
                 ('arTotalElectroDemand', 'arElectroPower'),
             ):
@@ -2049,33 +2070,43 @@ def view_run_results(request, sim_id, run_id):
 
             years_data.append(ydata)
 
-    # Append per-year wind speed data from all linked WindInput H5 files.
-    # When a date range was used, apply the same start/end hour slice so
-    # wind speed aligns with the simulated power data.
+    # Legacy fallback: append per-year wind speed from currently linked
+    # WindInput files only for outputs that do not already carry arWindSpeed.
     try:
-        import datetime as _dt_mod
-        wind_paths = _resolve_wind_h5_paths(sim)
-        ws_full = []
-        for wp in wind_paths:
-            with h5py.File(wp, 'r') as wf:
-                if 'WindSpeed' in wf:
-                    ws_full.extend(wf['WindSpeed'][0].tolist())
+        missing_windspeed = any(not yd.get('arWindSpeed') for yd in years_data)
+        if missing_windspeed:
+            import datetime as _dt_mod
+            wind_paths = _resolve_wind_h5_paths(sim)
+            ws_full = []
+            for wp in wind_paths:
+                with h5py.File(wp, 'r') as wf:
+                    if 'WindSpeed' in wf:
+                        # WindSpeed is expected to be hourly and may be stored as
+                        # (hours,), (1, hours), or a higher-rank array depending
+                        # on source tooling. Flatten in file order so the UI sees
+                        # the same chronological series used by the simulation.
+                        ws_arr = np.asarray(wf['WindSpeed'][:], dtype=float)
+                        if ws_arr.size:
+                            ws_full.extend(ws_arr.reshape(-1).tolist())
 
-        if ws_full:
-            # Determine the start-hour offset into the full wind array
-            _ws_start_hour = 0
-            if run.run_start_date:
-                datum = sim.datum_date or _dt_mod.date(run.run_start_date.year, 1, 1)
-                _ws_start_hour = max(0, int((run.run_start_date - datum).days * 24))
+            if ws_full:
+                # Determine the start-hour offset into the full wind array
+                _ws_start_hour = 0
+                if run.run_start_date:
+                    datum = sim.datum_date or _dt_mod.date(run.run_start_date.year, 1, 1)
+                    _ws_start_hour = max(0, int((run.run_start_date - datum).days * 24))
 
-            ws_sliced = ws_full[_ws_start_hour:]
+                ws_sliced = ws_full[_ws_start_hour:]
 
-            offset = 0
-            for yd in years_data:
-                ref = (yd.get('arSoc') or yd.get('arTotalH2') or yd.get('arElecOnAv') or [])
-                n = len(ref)
-                yd['arWindSpeed'] = ws_sliced[offset: offset + n] if n else []
-                offset += n
+                offset = 0
+                for yd in years_data:
+                    if yd.get('arWindSpeed'):
+                        offset += len(yd.get('arWindSpeed') or [])
+                        continue
+                    ref = (yd.get('arSoc') or yd.get('arTotalH2') or yd.get('arElecOnAv') or [])
+                    n = len(ref)
+                    yd['arWindSpeed'] = ws_sliced[offset: offset + n] if n else []
+                    offset += n
     except Exception:
         pass  # wind data is optional — silently skip if unavailable
 

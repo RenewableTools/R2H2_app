@@ -71,7 +71,7 @@ def control(units, battery, t_out, settings):
     # Positive demand charges the battery, negative demand discharges it.
     battery.arBatteryDemand = (
         total_available_power * rBatteryProportion
-    ) * battery.rBatteryProportionalGain
+    ) * battery.rBatteryProportionalGain * 0.01
 
     # Battery power-rate and SoC floor protection.
     per_sec_limit = 0.1 * battery_capacity / 3600.0
@@ -86,7 +86,7 @@ def control(units, battery, t_out, settings):
     )
 
     # Exponential smoothing (first-order low-pass)
-    tau = 30
+    tau = 1
     dt = settings.rTimeStep
     alpha = dt / (tau + dt)
     t_out.arElectroAvailablePower = np.zeros_like(t_out.arElectroAvailablePowerA)
@@ -94,8 +94,8 @@ def control(units, battery, t_out, settings):
     rMin   = units[0].rMinPower_s
     rRated = units[0].rRatedPower_s
 
-    hold_on_max_s = float(getattr(battery, "rSwitchOnAvoidingHoldMax_s", 120.0))
-    hold_off_max_s = float(getattr(battery, "rSwitchOffAvoidingHoldMax_s", 120.0))
+    hold_on_max_s = float(getattr(battery, "rSwitchOnAvoidingHoldMax_s", 180.0))
+    hold_off_max_s = float(getattr(battery, "rSwitchOffAvoidingHoldMax_s", 180.0))
     hold_on_remaining_s = float(
         getattr(battery, "rSwitchOnAvoidingHoldRemaining_s", hold_on_max_s)
     )

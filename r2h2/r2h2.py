@@ -364,6 +364,9 @@ def load_wind_h5(path: str, turbine_rated_W: float = 5.447e6) -> "WindInputs":
     wind = WindInputs()
     wind.arPowerInput = P
     wind.arTime = t
+    # Keep the hourly wind-speed series so downstream logging/UI can use the
+    # exact run input instead of re-reading mutable simulation links later.
+    setattr(wind, 'arWindSpeed', ws)
     return wind
 
 
@@ -1943,6 +1946,13 @@ class R2H2():
                 "No wind power data found.  Supply wind_h5_path= or set "
                 "self.windinputs.arPowerInput before calling run()."
             )
+        wind_speed_hours = None
+        try:
+            ws_attr = getattr(wind, 'arWindSpeed', None)
+            if ws_attr is not None:
+                wind_speed_hours = np.asarray(ws_attr, dtype=float).ravel()
+        except Exception:
+            wind_speed_hours = None
 
         # ── Initialise electrolyser units and PEM cell curves ────────────────
         self.setUpElectro1()
@@ -2082,6 +2092,7 @@ class R2H2():
                 "arEtaSystemPeak":   np.zeros(hours_per_year),
                 "arHourlyDegradation": np.zeros((units[0].iNumUnits, hours_per_year)),
                 "arWindPowerFilt":        np.zeros(hours_per_year),
+                "arWindSpeed":           np.zeros(hours_per_year),
                 "arAvailablePower":       np.zeros(hours_per_year),
                 "arTotalElectroDemand":   np.zeros(hours_per_year),
             }
@@ -2264,6 +2275,8 @@ class R2H2():
                 zLogOut["arEtaElPeak"][h]      = float(np.nanmax(t_out.arEta_el_total[_skip:]))
                 zLogOut["arEtaSystemPeak"][h]  = float(np.nanmax(t_out.arEta_system_total[_skip:]))
                 zLogOut["arWindPowerFilt"][h]      = float(np.nanmean(t_out.arWindPowerFilt[_skip:]))
+                if wind_speed_hours is not None and global_hour < wind_speed_hours.size:
+                    zLogOut["arWindSpeed"][h] = float(wind_speed_hours[global_hour])
                 zLogOut["arAvailablePower"][h]     = float(np.nanmean(t_out.arAvailablePower[_skip:]))
                 zLogOut["arTotalElectroDemand"][h] = float(np.nanmean(t_out.arTotalElectroDemand[_skip:]))
                 for i in range(units[0].iNumUnits):
