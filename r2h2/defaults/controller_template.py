@@ -15,6 +15,29 @@ The controller receives each hour:
   t_out    – TimeOutput object for this hourly step
   settings – SimulationSettings object (rTimeStep, rTransientSteps, …)
 
+Optional curtailment lever (inside ``control`` output):
+
+    t_out.arCurtailmentCapMW = <scalar or 1-D array>
+
+Example 1-D profile:
+
+    T_ctrl = len(t_out.arAvailablePower)
+    t_out.arCurtailmentCapMW = np.full(T_ctrl, 60.0)
+    t_out.arCurtailmentCapMW[: T_ctrl // 2] = 90.0
+
+Accepted forms:
+- scalar MW value (constant command)
+- 1-D MW array of length ``T_ctrl`` (controller axis)
+
+Core enforcement rules (applied by R2H2, not by the controller):
+- cap is an absolute farm cap in MW
+- changed cap must be held for at least 30 minutes
+- cap ramps at 0.1 * N MW/s, where N = number of electrolysers
+- ramp applies to cap trajectory only; realized wind may fall faster if raw wind drops
+
+Note: curtailment commands returned by ``control`` are applied from the next
+hour onward.
+
 Required return value: the tuple ``(units, t_out, battery)`` with at minimum:
 
 - ``t_out.arTotalElectroDemand``   – total electrolyser demand [W], 1-D length T_ctrl
@@ -87,6 +110,11 @@ def control(units, battery, t_out, settings):
     #    This axis already excludes the transient warm-up region.
     total_available_power = np.asarray(t_out.arAvailablePower, dtype=float)
     T = len(total_available_power)
+
+    # Optional curtailment lever for next-hour command scheduling.
+    # Example: 90 MW for the first half-hour, then 60 MW for the second half-hour.
+    t_out.arCurtailmentCapMW = np.full(T, 60.0, dtype=float)
+    t_out.arCurtailmentCapMW[: T // 2] = 90.0
 
     # 2) Electrolyser ON/OFF matrix [num_units, T_ctrl].
     #    Seed all timesteps from the previous known state (last column at entry)

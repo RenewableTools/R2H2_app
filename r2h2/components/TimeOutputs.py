@@ -6,6 +6,10 @@ class TimeOutputs(ComponentBase):
 
     def __init__(self, orm_object=None):
         self.arTime                  = None
+        self.arWindPowerRaw          = None
+        self.arWindPowerCurtailed    = None
+        self.arCurtailmentRequestedCap = None
+        self.arCurtailmentAppliedCap = None
         self.arWindPowerFilt         = None
         self.arAvailablePower        = None
         self.arElectroAvailablePowerA = None

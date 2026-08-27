@@ -85,6 +85,23 @@ class BankThermalPEM(BaseBankThermal):
     rT: float = 55.0
 
 
+@dataclass
+class CurtailmentState:
+    """Persistent state for wind curtailment command enforcement.
+
+    The command itself is a cap in MW provided by a custom controller hook.
+    Core enforcement applies:
+    - minimum hold duration between accepted command changes
+    - cap ramp-rate limit in W/s based on number of electrolysers
+    """
+
+    hold_seconds: int = 1800
+    requested_cap_w: Optional[float] = None
+    ramped_cap_w: Optional[float] = None
+    last_change_second: Optional[int] = None
+    next_hour_command_mw: Any = None
+
+
 # ---------------------------------------------------------------------------
 # Technology presets  (PEM only for now; ALK requires external UNIFI package)
 # ---------------------------------------------------------------------------
@@ -381,6 +398,176 @@ def lsim_first_order_lowpass(u: np.ndarray, t: np.ndarray, tau: float) -> np.nda
     dt = float(t[1] - t[0])
     discrete_system = system.to_discrete(dt)
     return signal.lfilter(discrete_system.num, discrete_system.den, u)
+
+
+def _normalise_curtailment_cap_mw(value: Any) -> Optional[float]:
+    """Normalise a user/controller cap value to a finite non-negative MW scalar."""
+    if value is None:
+        return None
+    try:
+        cap_mw = float(value)
+    except Exception:
+        return None
+    if not np.isfinite(cap_mw):
+        return None
+    return max(cap_mw, 0.0)
+
+
+def _resolve_curtailment_cap_mw(
+    provider,
+    *,
+    sim_second: int,
+    sim_hour: int,
+    second_in_hour: int,
+    total_steps: int,
+    transient_steps: int,
+    units,
+    battery,
+    settings,
+    state: CurtailmentState,
+) -> Optional[float]:
+    """Fetch an optional curtailment cap command from a provider.
+
+    Supported provider forms:
+    - scalar (float-like): constant cap in MW
+    - callable: preferred signature uses keyword args; fallback positional call
+    """
+    if provider is None:
+        return None
+
+    if not callable(provider):
+        scalar = _normalise_curtailment_cap_mw(provider)
+        if scalar is not None:
+            return scalar
+
+        try:
+            arr = np.asarray(provider, dtype=float).ravel()
+        except Exception:
+            return None
+        if arr.size == 0:
+            return None
+        if arr.size == 1:
+            return _normalise_curtailment_cap_mw(arr[0])
+
+        t_steps = max(int(total_steps), 1)
+        step0 = max(int(transient_steps), 0)
+        idx = int(second_in_hour)
+
+        # If a trimmed T_ctrl vector is provided, map early transient seconds
+        # to the first control sample and shift thereafter.
+        if arr.size == max(t_steps - step0, 0) and arr.size > 0:
+            idx = max(idx - step0, 0)
+
+        idx = max(0, min(idx, int(arr.size) - 1))
+        return _normalise_curtailment_cap_mw(arr[idx])
+
+    try:
+        cmd = provider(
+            sim_second=sim_second,
+            sim_hour=sim_hour,
+            second_in_hour=second_in_hour,
+            units=units,
+            battery=battery,
+            settings=settings,
+            state=state,
+        )
+    except TypeError:
+        # Backward-compatible fallback for a simple positional callable.
+        try:
+            cmd = provider(sim_second, sim_hour, second_in_hour)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+    return _normalise_curtailment_cap_mw(cmd)
+
+
+def _apply_curtailment_on_raw_wind(
+    raw_power: np.ndarray,
+    *,
+    dt: float,
+    hour_index_abs: int,
+    units,
+    battery,
+    settings,
+    state: Optional[CurtailmentState],
+    cap_provider=None,
+    transient_steps: int = 0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Apply curtailment to raw wind power before any downstream calculations.
+
+    The ramp limit applies to the cap trajectory only. Realized wind can drop
+    faster than the negative cap-ramp limit when raw wind naturally drops below
+    the current ramped cap.
+    """
+    raw = np.asarray(raw_power, dtype=float).ravel()
+    effective = raw.copy()
+    req_cap_w = np.full(raw.shape, np.nan, dtype=float)
+    app_cap_w = np.full(raw.shape, np.nan, dtype=float)
+
+    if state is None:
+        return effective, req_cap_w, app_cap_w
+
+    dt_s = max(float(dt), 0.0)
+    n_electro = max(int(getattr(units[0], 'iNumElectro', 1)), 1)
+    ramp_limit_w_s = 0.1 * 1e6 * n_electro
+    step_limit_w = ramp_limit_w_s * dt_s
+    hour_offset_s = int(round(hour_index_abs * raw.size * dt_s))
+
+    for k in range(raw.size):
+        abs_sec = hour_offset_s + int(round(k * dt_s))
+        cmd_mw = _resolve_curtailment_cap_mw(
+            cap_provider,
+            sim_second=abs_sec,
+            sim_hour=hour_index_abs,
+            second_in_hour=k,
+            total_steps=raw.size,
+            transient_steps=transient_steps,
+            units=units,
+            battery=battery,
+            settings=settings,
+            state=state,
+        )
+
+        if cmd_mw is not None:
+            cmd_w = cmd_mw * 1e6
+            if state.requested_cap_w is None:
+                state.requested_cap_w = cmd_w
+                state.last_change_second = abs_sec
+            elif abs(cmd_w - state.requested_cap_w) > 1e-9:
+                can_change = (
+                    state.last_change_second is None
+                    or (abs_sec - state.last_change_second) >= int(state.hold_seconds)
+                )
+                if can_change:
+                    state.requested_cap_w = cmd_w
+                    state.last_change_second = abs_sec
+
+        if state.requested_cap_w is None:
+            effective[k] = raw[k]
+            continue
+
+        if state.ramped_cap_w is None or not np.isfinite(state.ramped_cap_w):
+            state.ramped_cap_w = max(raw[k], 0.0)
+
+        ramped_cap_w = float(state.ramped_cap_w)
+        delta = state.requested_cap_w - ramped_cap_w
+        if step_limit_w <= 0.0:
+            ramped_cap_w = state.requested_cap_w
+        elif delta > step_limit_w:
+            ramped_cap_w += step_limit_w
+        elif delta < -step_limit_w:
+            ramped_cap_w -= step_limit_w
+        else:
+            ramped_cap_w = state.requested_cap_w
+
+        state.ramped_cap_w = max(ramped_cap_w, 0.0)
+        req_cap_w[k] = state.requested_cap_w
+        app_cap_w[k] = state.ramped_cap_w
+        effective[k] = min(raw[k], state.ramped_cap_w)
+
+    return effective, req_cap_w, app_cap_w
 
 
 # ---------------------------------------------------------------------------
@@ -751,6 +938,36 @@ def _call_controller_safe(fn, units, battery, t_out, settings, *, num_units, T):
     return ret_units, ret_t_out, ret_battery
 
 
+def _extract_controller_curtailment_command(t_out) -> Any:
+    """Extract an optional curtailment command from controller outputs.
+
+    Supported names on ``t_out`` (first match wins):
+    - ``arCurtailmentCapMW`` (vector or scalar)
+    - ``rCurtailmentCapMW``  (scalar)
+    - ``curtailment_cap_mw`` (scalar)
+    """
+    for attr in ("arCurtailmentCapMW", "rCurtailmentCapMW", "curtailment_cap_mw"):
+        raw = getattr(t_out, attr, None)
+        if raw is None:
+            continue
+
+        scalar = _normalise_curtailment_cap_mw(raw)
+        if scalar is not None:
+            return scalar
+
+        try:
+            arr = np.asarray(raw, dtype=float).ravel()
+        except Exception:
+            continue
+        if arr.size == 0:
+            continue
+
+        # Keep shape and order; normalisation is applied per-sample when used.
+        return arr
+
+    return None
+
+
 # Dynamic control (on/off dispatch + proportional sharing)
 # ---------------------------------------------------------------------------
 
@@ -909,12 +1126,39 @@ def runElectroStackStep1(
     t_out_prev,
     cooling_power_feedback: Optional[np.ndarray] = None,
     controller_fn=None,
+    curtailment_state: Optional[CurtailmentState] = None,
+    curtailment_cap_provider=None,
 ):
     num_units = units[0].iNumUnits
     T = len(arTime)
+    step0  = int(settings.rTransientSteps)
+    T_ctrl = T - step0
+
+    cap_source = None
+    if curtailment_state is not None and curtailment_state.next_hour_command_mw is not None:
+        cap_source = curtailment_state.next_hour_command_mw
+    elif curtailment_cap_provider is not None:
+        # Backward compatibility for older custom controllers.
+        cap_source = curtailment_cap_provider
+
+    # Wind curtailment is applied to raw wind before any downstream processing.
+    arWindPowerRaw = np.asarray(np.squeeze(arPowerInput), dtype=float).ravel()
+    arWindPowerCurtailed, arCurtailmentRequestedCap, arCurtailmentAppliedCap = (
+        _apply_curtailment_on_raw_wind(
+            arWindPowerRaw,
+            dt=settings.rTimeStep,
+            hour_index_abs=int(iCntHours),
+            units=units,
+            battery=battery,
+            settings=settings,
+            state=curtailment_state,
+            cap_provider=cap_source,
+            transient_steps=step0,
+        )
+    )
 
     # Wind → available power (filtered)
-    arWindPowerFilt = lsim_first_order_lowpass(np.squeeze(arPowerInput), arTime, 1.0)
+    arWindPowerFilt = lsim_first_order_lowpass(arWindPowerCurtailed, arTime, 1.0)
     arAvailablePower = arWindPowerFilt - units[0].rAncillaryPower_s * num_units
     if cooling_power_feedback is not None:
         cool_arr = np.asarray(cooling_power_feedback, dtype=float).ravel()
@@ -958,14 +1202,16 @@ def runElectroStackStep1(
     cache_nseg       = [0]    * num_units  # max valid segment index (len(arI) - 2)
 
     # ── Transient bookkeeping (computed once, used by helpers + physics loop) ─
-    step0  = int(settings.rTransientSteps)
-    T_ctrl = T - step0
 
     # ── Initialise output struct ─────────────────────────────────────────────
     aiIsOn = np.zeros((num_units, T), dtype=int)
 
     t_out = TimeOutputs()
     t_out.arTime                    = arTime
+    t_out.arWindPowerRaw            = arWindPowerRaw
+    t_out.arWindPowerCurtailed      = arWindPowerCurtailed
+    t_out.arCurtailmentRequestedCap = arCurtailmentRequestedCap
+    t_out.arCurtailmentAppliedCap   = arCurtailmentAppliedCap
     t_out.arWindPowerFilt           = arWindPowerFilt
     t_out.arAvailablePower          = arAvailablePower
     t_out.arElectroAvailablePowerA  = np.zeros_like(arAvailablePower)
@@ -1032,6 +1278,8 @@ def runElectroStackStep1(
             controller_fn, units, battery, t_out_ctrl, settings,
             num_units=num_units, T=T_ctrl,
         )
+        if curtailment_state is not None:
+            curtailment_state.next_hour_command_mw = _extract_controller_curtailment_command(t_out_ctrl)
     else:
         units, t_out_ctrl, battery = dynamicControl(units, battery, t_out_ctrl, settings)
 
@@ -1961,6 +2209,8 @@ class R2H2():
 
         # ── Load custom engineering controller (if configured) ───────────────
         _controller_fn = None
+        _curtailment_cap_provider = None
+        _curtailment_state = CurtailmentState(hold_seconds=1800)
         _ctrl_end_hour_buffer_map = None
         _ctrl_buffer_alias_map: Dict[str, Tuple[str, str]] = {}
         _ctrl_obj  = getattr(self.simulation_name, 'controller', None) if self.simulation_name is not None else None
@@ -1974,6 +2224,9 @@ class R2H2():
                 _ctrl_mod = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(_ctrl_mod)
                 _controller_fn = getattr(_ctrl_mod, 'control', None)
+                _curtailment_cap_provider = getattr(_ctrl_mod, 'get_curtailment_cap_mw', None)
+                if _curtailment_cap_provider is None and hasattr(_ctrl_mod, 'curtailment_cap_mw'):
+                    _curtailment_cap_provider = getattr(_ctrl_mod, 'curtailment_cap_mw')
                 _ctrl_end_hour_buffer_map = getattr(
                     _ctrl_mod,
                     'end_hour_buffer_map',
@@ -1995,6 +2248,8 @@ class R2H2():
                     _ctrl_buffer_alias_map = {}
                 if self.verbose:
                     print(f"  [run] Using custom controller: {_ctrl_file}", flush=True)
+                    if _curtailment_cap_provider is not None:
+                        print("  [run] Curtailment cap provider detected", flush=True)
             except Exception as _ctrl_err:
                 import warnings
                 warnings.warn(
@@ -2003,6 +2258,7 @@ class R2H2():
                     RuntimeWarning, stacklevel=2,
                 )
                 _controller_fn = None
+                _curtailment_cap_provider = None
                 _ctrl_end_hour_buffer_map = None
                 _ctrl_buffer_alias_map = {}
 
@@ -2129,9 +2385,11 @@ class R2H2():
 
                 units, t_out, battery, th_banks = runElectroStackStep1(
                     ec_curves, th_banks, battery, P_hour,
-                    units, wind.arTime, settings, h, t_out_prev,
+                    units, wind.arTime, settings, global_hour, t_out_prev,
                     cooling_power_feedback=_cooling_feedback_prev if _feedback else None,
                     controller_fn=_controller_fn,
+                    curtailment_state=_curtailment_state,
+                    curtailment_cap_provider=_curtailment_cap_provider,
                 )
 
                 if _feedback:

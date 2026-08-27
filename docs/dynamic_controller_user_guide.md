@@ -40,6 +40,24 @@ def control(units, battery, t_out, settings):
     return units, t_out, battery
 ```
 
+Optional curtailment lever (set inside `control`):
+
+```python
+t_out.arCurtailmentCapMW = 50.0              # scalar MW command
+t_out.arCurtailmentCapMW = np.full(T_ctrl, 50.0)  # per-second MW profile
+```
+
+Curtailment enforcement is always in core simulation code:
+- changed cap values are accepted no more frequently than once every 30 minutes
+- cap trajectory ramps at 0.1 * N MW/s (N = number of electrolysers)
+- realized wind input is `min(raw_wind, ramped_cap)` each second
+- the ramp limit applies to cap trajectory only, not directly to realized wind
+- commands emitted in one hour are applied from the next hour onward
+
+Backward compatibility note:
+- legacy module-level `get_curtailment_cap_mw(...)` / `curtailment_cap_mw` is still accepted
+- new controllers should set `t_out.arCurtailmentCapMW` inside `control`
+
 ### Inputs
 
 Your function receives:
@@ -226,6 +244,10 @@ Common causes:
 - NaN/Inf in required arrays.
 - Runtime exception in controller.
 - 30 s timeout in controller call.
+
+Curtailment note:
+- Invalid/non-finite curtailment commands are ignored.
+- Missing commands keep the last accepted cap.
 
 Checks:
 

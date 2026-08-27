@@ -2351,6 +2351,10 @@ def sim_1hz_variables(request, sim_id):
 
     # Built-in 1-D t_out array attributes from TimeOutputs (arrays of length T)
     _BUILTIN = [
+        'arWindPowerRaw',
+        'arWindPowerCurtailed',
+        'arCurtailmentRequestedCap',
+        'arCurtailmentAppliedCap',
         'arWindPowerFilt',
         'arAvailablePower',
         'arElectroAvailablePowerA',
