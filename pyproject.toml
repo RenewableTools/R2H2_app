@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "r2h2"
-version = "1.2.37"
+version = "1.2.38"
 description = "The Desktop App for R2H2."
 authors = [
     {name = "Renewable Tools Team", email = "r2h2@renewabletools.co.uk"},

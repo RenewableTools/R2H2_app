@@ -2150,9 +2150,16 @@ class R2H2():
 
             # ── Copy every DB field that exists in the component's defaults ─
             defaults = getattr(component, '_defaults', None) or vars(component)
+            computed_battery_fields = {
+                'rInitialBatteryRating',
+                'rBatteryRating',
+                'rBatteryProportionalGain',
+            }
             mapped, skipped = 0, 0
 
             for field_name in defaults:
+                if attr_name == 'battery' and field_name in computed_battery_fields:
+                    continue
                 if hasattr(db_obj, field_name):
                     db_value = getattr(db_obj, field_name)
                     if db_value is not None:

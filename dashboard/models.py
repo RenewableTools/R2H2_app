@@ -211,6 +211,28 @@ class Battery(models.Model):
     # CONTROL
     arBatteryDemand = models.JSONField(default=None, blank=True, null=True)
 
+    def _sync_derived_capacity_fields(self):
+        """Keep Joule-based battery fields aligned with the MWh capacity."""
+        try:
+            capacity_j = float(self.rBatteryMWh) * 3.6e9
+        except Exception:
+            capacity_j = 0.0
+
+        if capacity_j < 0.0 or not capacity_j == capacity_j:
+            capacity_j = 0.0
+
+        self.rInitialBatteryRating = capacity_j
+        self.rBatteryRating = capacity_j
+        self.rBatteryProportionalGain = capacity_j / 3600.0 / 10e6 if capacity_j > 0.0 else 0.0
+
+    def clean(self):
+        super().clean()
+        self._sync_derived_capacity_fields()
+
+    def save(self, *args, **kwargs):
+        self._sync_derived_capacity_fields()
+        return super().save(*args, **kwargs)
+
 
     def __str__(self):
         return f"ID: {self.id}, Name: {self.name} (MWh: {self.rBatteryMWh})"
