@@ -39,6 +39,7 @@ def control(units, battery, t_out, settings):
 
     # Curtailment lever for next hour: set a half-hour profile over T_ctrl.
     # This repeats each hour as [90 MW for first half, 60 MW for second half].
+    t_out.bCurtailmentOn = True
     half = max(T // 2, 1)
     t_out.arCurtailmentCapMW = np.full(T, 60.0, dtype=float)
     t_out.arCurtailmentCapMW[:half] = 90.0

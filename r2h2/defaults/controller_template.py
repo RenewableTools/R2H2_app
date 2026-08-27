@@ -17,17 +17,20 @@ The controller receives each hour:
 
 Optional curtailment lever (inside ``control`` output):
 
+    t_out.bCurtailmentOn = <bool or 1-D bool array>
     t_out.arCurtailmentCapMW = <scalar or 1-D array>
 
 Example 1-D profile:
 
     T_ctrl = len(t_out.arAvailablePower)
+    t_out.bCurtailmentOn = np.ones(T_ctrl, dtype=bool)
     t_out.arCurtailmentCapMW = np.full(T_ctrl, 60.0)
     t_out.arCurtailmentCapMW[: T_ctrl // 2] = 90.0
 
 Accepted forms:
-- scalar MW value (constant command)
-- 1-D MW array of length ``T_ctrl`` (controller axis)
+- scalar bool + scalar MW (constant command)
+- scalar bool + 1-D MW array of length ``T_ctrl`` (controller axis)
+- 1-D bool + 1-D MW arrays (time-varying enable and cap)
 
 Core enforcement rules (applied by R2H2, not by the controller):
 - cap is an absolute farm cap in MW
@@ -37,6 +40,7 @@ Core enforcement rules (applied by R2H2, not by the controller):
 
 Note: curtailment commands returned by ``control`` are applied from the next
 hour onward.
+To update curtailment, provide both ``bCurtailmentOn`` and a cap value.
 
 Required return value: the tuple ``(units, t_out, battery)`` with at minimum:
 
@@ -113,6 +117,7 @@ def control(units, battery, t_out, settings):
 
     # Optional curtailment lever for next-hour command scheduling.
     # Example: 90 MW for the first half-hour, then 60 MW for the second half-hour.
+    t_out.bCurtailmentOn = True
     t_out.arCurtailmentCapMW = np.full(T, 60.0, dtype=float)
     t_out.arCurtailmentCapMW[: T // 2] = 90.0
 

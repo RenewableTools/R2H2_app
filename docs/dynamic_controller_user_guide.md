@@ -43,9 +43,19 @@ def control(units, battery, t_out, settings):
 Optional curtailment lever (set inside `control`):
 
 ```python
+t_out.bCurtailmentOn = True                  # required enable flag
 t_out.arCurtailmentCapMW = 50.0              # scalar MW command
 t_out.arCurtailmentCapMW = np.full(T_ctrl, 50.0)  # per-second MW profile
 ```
+
+To update curtailment from `control`, provide both:
+- `t_out.bCurtailmentOn`
+- `t_out.arCurtailmentCapMW` (or `t_out.rCurtailmentCapMW`)
+
+Semantics:
+- `bCurtailmentOn = True` with a valid cap updates the requested cap.
+- `bCurtailmentOn = False` disables curtailment (wind passes through uncapped).
+- Missing either field means no curtailment command update.
 
 Curtailment enforcement is always in core simulation code:
 - changed cap values are accepted no more frequently than once every 30 minutes
@@ -56,7 +66,7 @@ Curtailment enforcement is always in core simulation code:
 
 Backward compatibility note:
 - legacy module-level `get_curtailment_cap_mw(...)` / `curtailment_cap_mw` is still accepted
-- new controllers should set `t_out.arCurtailmentCapMW` inside `control`
+- new controllers should set `t_out.bCurtailmentOn` and cap inside `control`
 
 ### Inputs
 

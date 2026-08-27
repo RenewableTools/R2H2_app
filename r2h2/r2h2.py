@@ -413,6 +413,62 @@ def _normalise_curtailment_cap_mw(value: Any) -> Optional[float]:
     return max(cap_mw, 0.0)
 
 
+def _normalise_curtailment_on(value: Any) -> Optional[bool]:
+    """Normalise a user/controller on/off flag for curtailment."""
+    if value is None:
+        return None
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in ("1", "true", "t", "yes", "y", "on"):
+            return True
+        if token in ("0", "false", "f", "no", "n", "off"):
+            return False
+        return None
+    try:
+        num = float(value)
+    except Exception:
+        return None
+    if not np.isfinite(num):
+        return None
+    if abs(num - 1.0) <= 1e-9:
+        return True
+    if abs(num) <= 1e-9:
+        return False
+    return None
+
+
+def _resolve_profile_sample(value: Any, *, second_in_hour: int, total_steps: int, transient_steps: int) -> Any:
+    """Resolve a scalar or profile-like value to one sample for this second."""
+    if value is None:
+        return None
+
+    if np.isscalar(value):
+        return value
+
+    try:
+        arr = np.asarray(value).ravel()
+    except Exception:
+        return value
+    if arr.size == 0:
+        return None
+    if arr.size == 1:
+        return arr[0]
+
+    t_steps = max(int(total_steps), 1)
+    step0 = max(int(transient_steps), 0)
+    idx = int(second_in_hour)
+
+    # If a trimmed T_ctrl vector is provided, map early transient seconds
+    # to the first control sample and shift thereafter.
+    if arr.size == max(t_steps - step0, 0) and arr.size > 0:
+        idx = max(idx - step0, 0)
+
+    idx = max(0, min(idx, int(arr.size) - 1))
+    return arr[idx]
+
+
 def _resolve_curtailment_cap_mw(
     provider,
     *,
@@ -425,41 +481,64 @@ def _resolve_curtailment_cap_mw(
     battery,
     settings,
     state: CurtailmentState,
-) -> Optional[float]:
+) -> Tuple[Optional[bool], Optional[float]]:
     """Fetch an optional curtailment cap command from a provider.
 
     Supported provider forms:
-    - scalar (float-like): constant cap in MW
+    - dict-like: {enabled: bool-like profile, cap_mw: MW profile/scalar}
+    - scalar (float-like): constant cap in MW (legacy, implies enabled=True)
     - callable: preferred signature uses keyword args; fallback positional call
+
+    Returns (enabled_cmd, cap_cmd_mw):
+    - enabled_cmd = True/False for explicit ON/OFF command, None for no update
+    - cap_cmd_mw = finite non-negative MW cap when supplied, else None
     """
     if provider is None:
-        return None
+        return None, None
+
+    if isinstance(provider, dict):
+        raw_enabled = None
+        for key in ("bCurtailmentOn", "curtailment_on", "enabled"):
+            if key in provider:
+                raw_enabled = provider.get(key)
+                break
+
+        raw_cap = None
+        for key in ("arCurtailmentCapMW", "rCurtailmentCapMW", "curtailment_cap_mw", "cap_mw"):
+            if key in provider:
+                raw_cap = provider.get(key)
+                break
+
+        enabled_sample = _resolve_profile_sample(
+            raw_enabled,
+            second_in_hour=second_in_hour,
+            total_steps=total_steps,
+            transient_steps=transient_steps,
+        )
+        enabled_cmd = _normalise_curtailment_on(enabled_sample)
+        if enabled_cmd is None:
+            return None, None
+
+        if not enabled_cmd:
+            return False, None
+
+        cap_sample = _resolve_profile_sample(
+            raw_cap,
+            second_in_hour=second_in_hour,
+            total_steps=total_steps,
+            transient_steps=transient_steps,
+        )
+        cap_cmd = _normalise_curtailment_cap_mw(cap_sample)
+        return True, cap_cmd
 
     if not callable(provider):
-        scalar = _normalise_curtailment_cap_mw(provider)
-        if scalar is not None:
-            return scalar
-
-        try:
-            arr = np.asarray(provider, dtype=float).ravel()
-        except Exception:
-            return None
-        if arr.size == 0:
-            return None
-        if arr.size == 1:
-            return _normalise_curtailment_cap_mw(arr[0])
-
-        t_steps = max(int(total_steps), 1)
-        step0 = max(int(transient_steps), 0)
-        idx = int(second_in_hour)
-
-        # If a trimmed T_ctrl vector is provided, map early transient seconds
-        # to the first control sample and shift thereafter.
-        if arr.size == max(t_steps - step0, 0) and arr.size > 0:
-            idx = max(idx - step0, 0)
-
-        idx = max(0, min(idx, int(arr.size) - 1))
-        return _normalise_curtailment_cap_mw(arr[idx])
+        sample = _resolve_profile_sample(
+            provider,
+            second_in_hour=second_in_hour,
+            total_steps=total_steps,
+            transient_steps=transient_steps,
+        )
+        return True, _normalise_curtailment_cap_mw(sample)
 
     try:
         cmd = provider(
@@ -476,11 +555,11 @@ def _resolve_curtailment_cap_mw(
         try:
             cmd = provider(sim_second, sim_hour, second_in_hour)
         except Exception:
-            return None
+            return None, None
     except Exception:
-        return None
+        return None, None
 
-    return _normalise_curtailment_cap_mw(cmd)
+    return True, _normalise_curtailment_cap_mw(cmd)
 
 
 def _apply_curtailment_on_raw_wind(
@@ -517,7 +596,7 @@ def _apply_curtailment_on_raw_wind(
 
     for k in range(raw.size):
         abs_sec = hour_offset_s + int(round(k * dt_s))
-        cmd_mw = _resolve_curtailment_cap_mw(
+        cmd_enabled, cmd_mw = _resolve_curtailment_cap_mw(
             cap_provider,
             sim_second=abs_sec,
             sim_hour=hour_index_abs,
@@ -530,7 +609,14 @@ def _apply_curtailment_on_raw_wind(
             state=state,
         )
 
-        if cmd_mw is not None:
+        if cmd_enabled is False:
+            state.requested_cap_w = None
+            state.ramped_cap_w = None
+            state.last_change_second = abs_sec
+            effective[k] = raw[k]
+            continue
+
+        if cmd_enabled and cmd_mw is not None:
             cmd_w = cmd_mw * 1e6
             if state.requested_cap_w is None:
                 state.requested_cap_w = cmd_w
@@ -941,31 +1027,32 @@ def _call_controller_safe(fn, units, battery, t_out, settings, *, num_units, T):
 def _extract_controller_curtailment_command(t_out) -> Any:
     """Extract an optional curtailment command from controller outputs.
 
-    Supported names on ``t_out`` (first match wins):
-    - ``arCurtailmentCapMW`` (vector or scalar)
-    - ``rCurtailmentCapMW``  (scalar)
-    - ``curtailment_cap_mw`` (scalar)
+    Preferred controller contract:
+    - ``t_out.bCurtailmentOn`` (scalar or 1-D profile)
+    - ``t_out.arCurtailmentCapMW`` / ``t_out.rCurtailmentCapMW`` (cap values)
+
+    The returned command is a dict consumed by the core curtailment resolver.
+    If either component is absent, no command is emitted.
     """
+    enabled = None
+    for attr in ("bCurtailmentOn", "arCurtailmentOn"):
+        enabled = getattr(t_out, attr, None)
+        if enabled is not None:
+            break
+
+    cap = None
     for attr in ("arCurtailmentCapMW", "rCurtailmentCapMW", "curtailment_cap_mw"):
-        raw = getattr(t_out, attr, None)
-        if raw is None:
-            continue
+        cap = getattr(t_out, attr, None)
+        if cap is not None:
+            break
 
-        scalar = _normalise_curtailment_cap_mw(raw)
-        if scalar is not None:
-            return scalar
+    if enabled is None or cap is None:
+        return None
 
-        try:
-            arr = np.asarray(raw, dtype=float).ravel()
-        except Exception:
-            continue
-        if arr.size == 0:
-            continue
-
-        # Keep shape and order; normalisation is applied per-sample when used.
-        return arr
-
-    return None
+    return {
+        "bCurtailmentOn": enabled,
+        "arCurtailmentCapMW": cap,
+    }
 
 
 # Dynamic control (on/off dispatch + proportional sharing)
